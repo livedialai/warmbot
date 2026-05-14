@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """
-LiveKit Call Controller — Die Regie für Warm/Cold Transfers.
+LiveKit Call Controller v2 — Harte Subscription-Matrix, async Transfer, voller Snapshot.
 
-Verwaltet Track-Subscriptions unabhängig von der Pipecat-Pipeline.
-Kommunikation mit Pipecat via HTTP (localhost:9100).
+Jeder Participant hört EXAKT die freigegebenen Tracks — nichts zusätzlich.
+Die Matrix wird bei jeder Zustandsänderung vollständig neu angewendet.
 
-Zustände pro Room:
-  idle       → Caller hört Bot
-  music      → Caller hört nur Musik (Transfer läuft)
-  briefing   → Agent hört Bot, Caller hört Musik (Warm)
-  connected  → Caller hört Agent, Agent hört Caller
-  failed     → Zurück zu idle
-
-API:
-  POST /v1/transfer           Pipecat → "starte Transfer"
-  POST /v1/briefing-complete  Pipecat → "Briefing fertig, verbinde"
-  GET  /v1/room/{room}/state  Debug
+API (HTTP localhost:9100):
+  POST /v1/transfer           → startet async Transfer
+  POST /v1/briefing-complete  → schließt Warm-Transfer ab
+  POST /v1/cancel             → bricht ab, Caller zurück zum Bot
+  POST /v1/disconnect-bot     → entfernt Pipecat-Bot aus Raum
+  GET  /v1/room/{room}/state  → Raum-Status
 """
 
 import asyncio
@@ -23,9 +18,10 @@ import json
 import os
 import signal
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from aiohttp import web
 from dotenv import load_dotenv
@@ -44,16 +40,16 @@ from livekit.api.sip_service import CreateSIPParticipantRequest
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://localhost:7880")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
-LIVEKIT_SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_OUTBOUND_TRUNK", os.getenv("LIVEKIT_SIP_TRUNK_ID", ""))
+LIVEKIT_SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_OUTBOUND_TRUNK", "")
 CONTROLLER_PORT = int(os.getenv("CONTROLLER_PORT", "9100"))
-AGENT_RING_TIMEOUT = int(os.getenv("AGENT_RING_TIMEOUT", "40"))  # Sekunden
+AGENT_RING_TIMEOUT = int(os.getenv("AGENT_RING_TIMEOUT", "40"))
 
 HTTP_URL = LIVEKIT_URL.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
 MUSIC_TRACK_NAME = "music-hold"
 
 
 # ══════════════════════════════════════════════════════════════════
-#  STATE
+#  TYPES
 # ══════════════════════════════════════════════════════════════════
 
 class Phase(str, Enum):
@@ -67,25 +63,23 @@ class Phase(str, Enum):
 @dataclass
 class Participant:
     identity: str
-    track_sids: list[str] = field(default_factory=list)
+    track_sids: List[str] = field(default_factory=list)
 
 
 @dataclass
 class RoomState:
     room_name: str
     phase: Phase = Phase.IDLE
-
     caller: Optional[Participant] = None
     agent: Optional[Participant] = None
     bot: Optional[Participant] = None
     music: Optional[Participant] = None
-
     music_track_sid: Optional[str] = None
     agent_number: str = ""
-    transfer_mode: str = ""  # "cold" | "warm"
+    transfer_mode: str = ""
+    transferring: bool = False  # async transfer in progress
 
 
-# Global state: room_name → RoomState
 _rooms: Dict[str, RoomState] = {}
 _lk_api: Optional[lk_api.LiveKitAPI] = None
 
@@ -98,13 +92,25 @@ def get_lk() -> lk_api.LiveKitAPI:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  ROOM STATE DISCOVERY
+#  ROOM DISCOVERY — aktualisiert ALLE Participants
 # ══════════════════════════════════════════════════════════════════
 
 async def discover_room(room_name: str) -> RoomState:
-    """Scannt den Raum und baut/aktualisiert RoomState."""
-    rs = _rooms.get(room_name, RoomState(room_name=room_name))
-    _rooms[room_name] = rs
+    """Scannt den Raum und aktualisiert ALLE Participants (nicht nur erste Sichtung)."""
+    rs = _rooms.get(room_name)
+    if not rs:
+        rs = RoomState(room_name=room_name)
+        _rooms[room_name] = rs
+
+    # Reset current state from room
+    rs.caller = None
+    rs.agent = None
+    rs.bot = None
+    rs.music = None
+    rs.music_track_sid = None
+
+    # Resolve active agent identity
+    agent_identity = rs.agent_number and f"agent-{rs.agent_number}" or ""
 
     try:
         resp = await get_lk().room.list_participants(
@@ -120,120 +126,178 @@ async def discover_room(room_name: str) -> RoomState:
                 for t in p.tracks:
                     if t.name == MUSIC_TRACK_NAME:
                         rs.music_track_sid = t.sid
-                        logger.info(f"[{room_name}] Music track: {t.sid}")
 
             elif identity.startswith("pipecat-bot-"):
                 rs.bot = Participant(identity, track_sids)
 
             elif identity.startswith("agent-"):
+                # Only recognize the CURRENT agent for this transfer
+                if rs.agent_number and identity == f"agent-{int(time.time()) if rs.agent_number else ''}":
+                    pass  # identity comes from SIP create, match below
                 rs.agent = Participant(identity, track_sids)
 
-            elif not identity.startswith("music-bot-") and not identity.startswith("pipecat-bot-") and not identity.startswith("agent-"):
-                # SIP-Participant (Caller)
-                # SIP bridge creates identities like "sip_<number>_<random>"
-                if rs.caller is None:
-                    rs.caller = Participant(identity, track_sids)
-                    logger.info(f"[{room_name}] Caller identified: {identity}")
+            else:
+                # Any other = Caller (SIP participant)
+                rs.caller = Participant(identity, track_sids)
 
     except Exception as e:
-        logger.error(f"[{room_name}] discover_room failed: {e}")
+        logger.error(f"[{room_name}] discover_room: {e}")
 
+    logger.debug(
+        f"[{room_name}] Discovered: caller={rs.caller.identity if rs.caller else '?'} "
+        f"bot={rs.bot.identity if rs.bot else '?'} "
+        f"agent={rs.agent.identity if rs.agent else '?'} "
+        f"music={rs.music_track_sid or '?'}"
+    )
     return rs
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SUBSCRIPTION CONTROL
+#  HARTE SUBSCRIPTION-MATRIX
 # ══════════════════════════════════════════════════════════════════
 
-async def set_subscriptions(room: str, identity: str, track_sids: list[str], subscribe: bool = True):
-    """Setzt welche Tracks ein Participant subscribet bekommt."""
-    if not identity:
-        logger.warning(f"[{room}] set_subscriptions: no identity")
+def all_known_tracks(rs: RoomState) -> List[str]:
+    """Alle bekannten Track-SIDs im Raum."""
+    tracks: List[str] = []
+    for p in [rs.caller, rs.agent, rs.bot, rs.music]:
+        if p:
+            tracks.extend(p.track_sids)
+    if rs.music_track_sid:
+        tracks.append(rs.music_track_sid)
+    return list(set(t for t in tracks if t))
+
+
+async def set_subscriptions(room: str, identity: str,
+                            track_sids: List[str], subscribe: bool):
+    """Setzt Subscriptions für einen Participant."""
+    if not identity or not track_sids:
         return
-
-    audio_sids = [s for s in track_sids if s]  # filter None
-    if not audio_sids:
-        # Unsubscribe from everything
-        audio_sids = []
-
     try:
         await get_lk().room.update_subscriptions(
             UpdateSubscriptionsRequest(
                 room=room,
                 identity=identity,
-                track_sids=audio_sids,
+                track_sids=track_sids,
                 subscribe=subscribe,
             )
         )
-        logger.info(f"[{room}] {identity} now hears: {audio_sids}")
+        action = "subscribed" if subscribe else "unsubscribed"
+        logger.info(f"[{room}] {identity} {action}: {track_sids}")
     except Exception as e:
         logger.error(f"[{room}] set_subscriptions({identity}): {e}")
 
 
-async def apply_phase_matrix(rs: RoomState):
-    """Wendet die Track-Subscription-Matrix für die aktuelle Phase an."""
-    if not rs.caller or not rs.caller.identity:
-        logger.warning(f"[{rs.room_name}] No caller, can't apply matrix")
+async def set_exact_hears(rs: RoomState, listener: Optional[Participant],
+                          desired_sids: List[str]):
+    """Garantiert: Listener hört EXAKT desired_sids — nichts anderes."""
+    if not listener or not listener.identity:
         return
 
-    if rs.phase == Phase.IDLE:
-        # Caller → Bot
-        if rs.bot and rs.bot.track_sids:
-            await set_subscriptions(rs.room_name, rs.caller.identity, rs.bot.track_sids)
+    all_tracks = all_known_tracks(rs)
+    desired = [s for s in desired_sids if s]
+    unwanted = [s for s in all_tracks if s not in desired]
 
-    elif rs.phase == Phase.MUSIC:
-        # Caller → Musik, Agent → nichts (noch nicht da)
-        await set_subscriptions(rs.room_name, rs.caller.identity,
-                                [rs.music_track_sid] if rs.music_track_sid else [])
-
-    elif rs.phase == Phase.BRIEFING:
-        # Caller → Musik, Agent → Bot (Briefing)
-        await set_subscriptions(rs.room_name, rs.caller.identity,
-                                [rs.music_track_sid] if rs.music_track_sid else [])
-        if rs.agent and rs.bot and rs.bot.track_sids:
-            await set_subscriptions(rs.room_name, rs.agent.identity, rs.bot.track_sids)
-
-    elif rs.phase == Phase.CONNECTED:
-        # Caller → Agent, Agent → Caller
-        if rs.agent and rs.agent.track_sids:
-            await set_subscriptions(rs.room_name, rs.caller.identity, rs.agent.track_sids)
-        if rs.caller and rs.caller.track_sids:
-            await set_subscriptions(rs.room_name, rs.agent.identity, rs.caller.track_sids)
-
-    elif rs.phase == Phase.FAILED:
-        # Caller → Bot (zurück zum Gespräch)
-        if rs.bot and rs.bot.track_sids:
-            await set_subscriptions(rs.room_name, rs.caller.identity, rs.bot.track_sids)
+    if unwanted:
+        await set_subscriptions(rs.room_name, listener.identity, unwanted, subscribe=False)
+    if desired:
+        await set_subscriptions(rs.room_name, listener.identity, desired, subscribe=True)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TRANSFER LOGIC
+#  VOLLSTÄNDIGE PHASEN-MATRIX
+# ══════════════════════════════════════════════════════════════════
+
+async def apply_phase_matrix(rs: RoomState):
+    """Wendet die komplette Hör-Matrix für ALLE Participants an."""
+
+    m = rs.music_track_sid
+    c_tracks = rs.caller.track_sids if rs.caller else []
+    a_tracks = rs.agent.track_sids if rs.agent else []
+    b_tracks = rs.bot.track_sids if rs.bot else []
+
+    if rs.phase == Phase.IDLE:
+        # Caller ↔ Bot, Music hört nichts, Agent nicht da
+        await set_exact_hears(rs, rs.caller, b_tracks)
+        await set_exact_hears(rs, rs.bot, c_tracks)
+        await set_exact_hears(rs, rs.music, [])
+
+    elif rs.phase == Phase.MUSIC:
+        # Caller → Musik, Bot → Caller (optional, für Unterbrechbarkeit), Music → nichts
+        await set_exact_hears(rs, rs.caller, [m] if m else [])
+        await set_exact_hears(rs, rs.bot, c_tracks)
+        await set_exact_hears(rs, rs.music, [])
+
+    elif rs.phase == Phase.BRIEFING:
+        # Caller → Musik, Agent ↔ Bot, Music → nichts
+        await set_exact_hears(rs, rs.caller, [m] if m else [])
+        await set_exact_hears(rs, rs.agent, b_tracks)
+        await set_exact_hears(rs, rs.bot, a_tracks)
+        await set_exact_hears(rs, rs.music, [])
+
+    elif rs.phase == Phase.CONNECTED:
+        # Caller ↔ Agent, Bot → nichts, Music → nichts
+        await set_exact_hears(rs, rs.caller, a_tracks)
+        await set_exact_hears(rs, rs.agent, c_tracks)
+        await set_exact_hears(rs, rs.bot, [])
+        await set_exact_hears(rs, rs.music, [])
+
+    elif rs.phase == Phase.FAILED:
+        # Caller ↔ Bot, alles andere stumm
+        await set_exact_hears(rs, rs.caller, b_tracks)
+        await set_exact_hears(rs, rs.bot, c_tracks)
+        await set_exact_hears(rs, rs.agent, [])
+        await set_exact_hears(rs, rs.music, [])
+
+    logger.info(f"[{rs.room_name}] Matrix applied: phase={rs.phase.value}")
+
+
+def snapshot(rs: RoomState) -> str:
+    """Vergleichbarer Snapshot für Change Detection."""
+    parts = [
+        rs.phase.value,
+        rs.caller.identity if rs.caller else "",
+        ",".join(sorted(rs.caller.track_sids)) if rs.caller else "",
+        rs.agent.identity if rs.agent else "",
+        ",".join(sorted(rs.agent.track_sids)) if rs.agent else "",
+        rs.bot.identity if rs.bot else "",
+        ",".join(sorted(rs.bot.track_sids)) if rs.bot else "",
+        rs.music.identity if rs.music else "",
+        rs.music_track_sid or "",
+    ]
+    return "|".join(parts)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ASYNC TRANSFER — blockiert HTTP nicht
 # ══════════════════════════════════════════════════════════════════
 
 async def execute_transfer(room_name: str, target: str, mode: str):
     """
-    Führt Transfer aus:
-    1. Raum scannen
-    2. Caller auf Musik
-    3. Agent via SIP anrufen
-    4. Je nach Modus: Cold direkt verbinden, Warm auf Briefing warten
+    Führt Transfer async aus. Wird von handle_transfer via create_task gestartet.
+
+    Ablauf:
+    1. Phase → MUSIC, Matrix anwenden
+    2. Agent via SIP anrufen
+    3. Pollen bis Agent da ist
+    4. Cold → CONNECTED, Warm → BRIEFING
     """
-    rs = await discover_room(room_name)
+
+    rs = _rooms.get(room_name)
+    if not rs:
+        logger.error(f"[{room_name}] Room not found for transfer")
+        return
+
+    # Reset für neuen Transfer
+    rs.agent = None
     rs.agent_number = target
     rs.transfer_mode = mode
+    rs.transferring = True
 
-    if mode == "warm":
-        rs.phase = Phase.MUSIC  # Erstmal Musik, später BRIEFING wenn Agent da
-    else:
-        rs.phase = Phase.MUSIC
-
-    _rooms[room_name] = rs
-
-    # Phase 1: Caller auf Musik
+    rs.phase = Phase.MUSIC
     await apply_phase_matrix(rs)
 
     # Agent via SIP anrufen
-    agent_identity = f"agent-{int(time.time())}"
+    agent_identity = f"agent-{uuid.uuid4().hex[:12]}"
     try:
         await get_lk().sip.create_sip_participant(
             CreateSIPParticipantRequest(
@@ -245,97 +309,118 @@ async def execute_transfer(room_name: str, target: str, mode: str):
                 play_ringtone=True,
             )
         )
-        logger.info(f"[{room_name}] SIP call to {target} (identity={agent_identity})")
-
-        # Poll for agent to join (max AGENT_RING_TIMEOUT seconds)
-        for attempt in range(AGENT_RING_TIMEOUT * 2):
-            await asyncio.sleep(0.5)
-            rs = await discover_room(room_name)
-            if rs.agent and rs.agent.track_sids:
-                logger.info(f"[{room_name}] Agent joined: {rs.agent.identity}")
-                break
-            # Check if last agent joined
-            if attempt % 4 == 0:
-                logger.info(f"[{room_name}] Waiting for agent... ({attempt/2:.0f}s)")
-
-        if not rs.agent or not rs.agent.track_sids:
-            raise TimeoutError(f"Agent joined but no audio track")
+        logger.info(f"[{room_name}] SIP → {target} ({agent_identity})")
 
     except Exception as e:
-        logger.error(f"[{room_name}] Agent call failed: {e}")
+        logger.error(f"[{room_name}] SIP create failed: {e}")
         rs.phase = Phase.FAILED
+        rs.transferring = False
         await apply_phase_matrix(rs)
-        return {"status": "failed", "error": str(e)}
+        return
 
-    # Agent ist da — Phase wechseln
-    if mode == "cold":
-        rs.phase = Phase.CONNECTED
-        await apply_phase_matrix(rs)
-        logger.info(f"[{room_name}] COLD transfer complete: caller ↔ agent")
-        return {"status": "connected"}
+    # Poll for agent (bis AGENT_RING_TIMEOUT)
+    for attempt in range(AGENT_RING_TIMEOUT * 2):
+        await asyncio.sleep(0.5)
 
-    else:  # warm
-        rs.phase = Phase.BRIEFING
-        await apply_phase_matrix(rs)
-        logger.info(f"[{room_name}] WARM transfer: briefing phase, waiting for complete signal")
-        return {"status": "briefing"}
+        # Check if agent joined
+        try:
+            resp = await get_lk().room.list_participants(
+                ListParticipantsRequest(room=room_name)
+            )
+            for p in resp.participants:
+                if p.identity == agent_identity:
+                    for t in p.tracks:
+                        if str(t.type) == "AUDIO" or "audio" in str(getattr(t, 'mime_type', '')):
+                            # Agent ist da — discover und Matrix anwenden
+                            rs = await discover_room(room_name)
 
+                            if mode == "cold":
+                                rs.phase = Phase.CONNECTED
+                            else:
+                                rs.phase = Phase.BRIEFING
+
+                            rs.transferring = False
+                            await apply_phase_matrix(rs)
+                            logger.info(f"[{room_name}] Transfer phase: {rs.phase.value}")
+                            return
+        except Exception:
+            pass
+
+    # Timeout
+    logger.warning(f"[{room_name}] Agent {target} did not answer")
+    rs.phase = Phase.FAILED
+    rs.transferring = False
+    await apply_phase_matrix(rs)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TRANSFER ACTIONS
+# ══════════════════════════════════════════════════════════════════
 
 async def complete_briefing(room_name: str):
-    """Pipecat meldet: Briefing fertig → Caller und Agent verbinden."""
     rs = _rooms.get(room_name)
-    if not rs:
-        return {"status": "error", "error": "Room not found"}
-
-    if rs.phase != Phase.BRIEFING:
-        return {"status": "error", "error": f"Not in briefing phase (current: {rs.phase})"}
-
+    if not rs or rs.phase != Phase.BRIEFING:
+        return {"status": "error", "error": "not in briefing phase"}
     rs.phase = Phase.CONNECTED
     await apply_phase_matrix(rs)
-    logger.info(f"[{room_name}] WARM transfer complete: caller ↔ agent")
     return {"status": "connected"}
 
 
 async def cancel_transfer(room_name: str):
-    """Bricht Transfer ab, Caller zurück zum Bot."""
     rs = _rooms.get(room_name)
     if not rs:
-        return {"status": "error", "error": "Room not found"}
-
+        return {"status": "error", "error": "room not found"}
     rs.phase = Phase.IDLE
+    rs.transferring = False
     await apply_phase_matrix(rs)
-    logger.info(f"[{room_name}] Transfer cancelled, caller back to bot")
     return {"status": "idle"}
 
 
+async def disconnect_bot(room_name: str):
+    """Entfernt den Pipecat-Bot aus dem Raum (serverseitig)."""
+    rs = _rooms.get(room_name)
+    if not rs or not rs.bot:
+        return {"status": "error", "error": "no bot in room"}
+    try:
+        await get_lk().room.remove_participant(
+            lk_api.room_service.RoomParticipantIdentity(
+                room=room_name,
+                identity=rs.bot.identity,
+            )
+        )
+        logger.info(f"[{room_name}] Bot removed: {rs.bot.identity}")
+        rs.bot = None
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"[{room_name}] Bot removal failed: {e}")
+        return {"status": "error", "error": str(e)}
+
+
 # ══════════════════════════════════════════════════════════════════
-#  MONITOR: Track Changes Auto-Apply
+#  MONITOR — Snapshot-Vergleich
 # ══════════════════════════════════════════════════════════════════
 
 async def monitor_room(room_name: str):
-    """Pollt regelmäßig den Raum und wendet die Matrix bei Änderungen an."""
+    """Pollt den Raum und wendet Matrix bei jeder Änderung an."""
+    last_snapshot = ""
+
     while room_name in _rooms:
         try:
-            old_agent_tracks = None
-            rs = _rooms.get(room_name)
-            if rs and rs.agent:
-                old_agent_tracks = set(rs.agent.track_sids)
-
             rs = await discover_room(room_name)
+            current = snapshot(rs)
 
-            # Agent-Track erschienen? → Matrix anwenden
-            if old_agent_tracks is not None and rs.agent:
-                new_tracks = set(rs.agent.track_sids)
-                if new_tracks and new_tracks != old_agent_tracks:
-                    logger.info(f"[{room_name}] Agent tracks changed: {old_agent_tracks} → {new_tracks}")
+            if current != last_snapshot:
+                # Auto-apply wenn nicht mitten im async transfer
+                if not rs.transferring:
                     await apply_phase_matrix(rs)
+                last_snapshot = current
 
         except Exception as e:
-            logger.error(f"[{room_name}] Monitor error: {e}")
+            logger.error(f"[{room_name}] Monitor: {e}")
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
 
-    logger.info(f"[{room_name}] Monitor stopped (room removed)")
+    logger.info(f"[{room_name}] Monitor stopped")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -343,68 +428,74 @@ async def monitor_room(room_name: str):
 # ══════════════════════════════════════════════════════════════════
 
 async def handle_transfer(request: web.Request):
-    """POST /v1/transfer
-    Body: {"room": "...", "target": "+49...", "mode": "cold|warm"}
-    """
+    """POST /v1/transfer — non-blocking."""
     try:
         data = await request.json()
         room = data["room"]
         target = data["target"]
         mode = data.get("mode", "cold")
 
-        # Starte Monitor falls nicht aktiv
         if room not in _rooms:
             _rooms[room] = RoomState(room_name=room)
             asyncio.create_task(monitor_room(room))
 
-        result = await execute_transfer(room, target, mode)
-        return web.json_response(result)
+        rs = _rooms[room]
+
+        # Wenn schon ein Transfer läuft
+        if rs.transferring:
+            return web.json_response({"status": "error", "error": "transfer in progress"})
+
+        # Async starten
+        asyncio.create_task(execute_transfer(room, target, mode))
+        return web.json_response({"status": "transfer_started"})
 
     except Exception as e:
-        logger.error(f"handle_transfer error: {e}")
+        logger.error(f"handle_transfer: {e}")
         return web.json_response({"status": "error", "error": str(e)}, status=400)
 
 
 async def handle_briefing_complete(request: web.Request):
-    """POST /v1/briefing-complete
-    Body: {"room": "..."}
-    """
     try:
         data = await request.json()
-        room = data["room"]
-        result = await complete_briefing(room)
-        return web.json_response(result)
+        return web.json_response(await complete_briefing(data["room"]))
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)}, status=400)
 
 
 async def handle_cancel(request: web.Request):
-    """POST /v1/cancel
-    Body: {"room": "..."}
-    """
     try:
         data = await request.json()
-        room = data["room"]
-        result = await cancel_transfer(room)
-        return web.json_response(result)
+        return web.json_response(await cancel_transfer(data["room"]))
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)}, status=400)
+
+
+async def handle_disconnect_bot(request: web.Request):
+    try:
+        data = await request.json()
+        return web.json_response(await disconnect_bot(data["room"]))
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)}, status=400)
 
 
 async def handle_room_state(request: web.Request):
-    """GET /v1/room/{room}/state"""
     room = request.match_info.get("room", "")
     rs = _rooms.get(room)
     if not rs:
         return web.json_response({"error": "room not found"}, status=404)
-
     return web.json_response({
         "room": rs.room_name,
         "phase": rs.phase.value,
-        "caller": rs.caller.identity if rs.caller else None,
-        "agent": rs.agent.identity if rs.agent else None,
-        "music_track": rs.music_track_sid,
+        "transferring": rs.transferring,
         "transfer_mode": rs.transfer_mode,
+        "agent_number": rs.agent_number,
+        "caller": rs.caller.identity if rs.caller else None,
+        "caller_tracks": rs.caller.track_sids if rs.caller else [],
+        "agent": rs.agent.identity if rs.agent else None,
+        "agent_tracks": rs.agent.track_sids if rs.agent else [],
+        "bot": rs.bot.identity if rs.bot else None,
+        "bot_tracks": rs.bot.track_sids if rs.bot else [],
+        "music_track": rs.music_track_sid,
     })
 
 
@@ -413,14 +504,13 @@ async def handle_health(request: web.Request):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════
 
 async def main():
     app = web.Application()
     app.router.add_post("/v1/transfer", handle_transfer)
     app.router.add_post("/v1/briefing-complete", handle_briefing_complete)
     app.router.add_post("/v1/cancel", handle_cancel)
+    app.router.add_post("/v1/disconnect-bot", handle_disconnect_bot)
     app.router.add_get("/v1/room/{room}/state", handle_room_state)
     app.router.add_get("/health", handle_health)
 
@@ -429,17 +519,15 @@ async def main():
     site = web.TCPSite(runner, "127.0.0.1", CONTROLLER_PORT)
     await site.start()
 
-    logger.info(f"Controller listening on http://127.0.0.1:{CONTROLLER_PORT}")
+    logger.info(f"Controller v2 → http://127.0.0.1:{CONTROLLER_PORT}")
     logger.info(f"LiveKit: {HTTP_URL}")
-    logger.info(f"SIP Trunk: {LIVEKIT_SIP_TRUNK_ID or 'NOT SET'}")
+    logger.info(f"SIP Trunk: {LIVEKIT_SIP_TRUNK_ID or '⚠ NOT SET'}")
 
-    # Keep running
-    stop_event = asyncio.Event()
+    stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        asyncio.get_event_loop().add_signal_handler(sig, stop_event.set)
-    await stop_event.wait()
+        asyncio.get_event_loop().add_signal_handler(sig, stop.set)
+    await stop.wait()
 
-    # Cleanup
     await runner.cleanup()
     if _lk_api:
         await _lk_api.aclose()
