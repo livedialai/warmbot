@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Pipecat Transfer Agent v2 — Voice AI, strikt getrennt vom Controller.
+Pipecat Transfer Agent v2.1 — Voice AI mit ToolsSchema + ConversationTracker.
 
-auto_subscribe=False — der Controller entscheidet, was der Bot hört.
-Expliziter Transfer-Flow statt Text-Matching.
+auto_subscribe=False — der Controller steuert, was der Bot hört.
+Expliziter Transfer-Flow mit Polling.
 """
 
 import asyncio
@@ -23,9 +23,12 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.frames.frames import (
-    EndFrame, TTSTextFrame, FunctionCallResultFrame,
+    EndFrame, TTSTextFrame, TranscriptionFrame,
     UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
 )
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair, LLMUserAggregatorParams,
 )
@@ -39,19 +42,15 @@ from pipecat.transports.livekit.transport import LiveKitTransport, LiveKitParams
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://localhost:7880")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
-
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen3")
-
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 DEEPGRAM_MODEL = os.getenv("DEEPGRAM_MODEL", "nova-3")
 DEEPGRAM_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "de")
-
 AZURE_TTS_KEY = os.getenv("AZURE_TTS_KEY", "")
 AZURE_TTS_REGION = os.getenv("AZURE_TTS_REGION", "germanywestcentral")
 AZURE_TTS_VOICE = os.getenv("AZURE_TTS_VOICE", "de-DE-KatjaNeural")
-
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 HA_API_KEY = os.getenv("HA_API_KEY", "")
 CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://127.0.0.1:9100")
@@ -59,7 +58,7 @@ TRANSFER_TIMEOUT = int(os.getenv("TRANSFER_TIMEOUT", "60"))
 
 
 # ══════════════════════════════════════════════════════════════════
-#  CONTROLLER CLIENT (robust)
+#  HTTP CLIENTS
 # ══════════════════════════════════════════════════════════════════
 
 async def call_controller(endpoint: str, data: dict, timeout: int = 60) -> dict:
@@ -68,8 +67,7 @@ async def call_controller(endpoint: str, data: dict, timeout: int = 60) -> dict:
             async with s.post(f"{CONTROLLER_URL}{endpoint}", json=data) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
-                    logger.error(f"Controller {endpoint}: HTTP {resp.status}: {text[:200]}")
-                    return {"status": "error", "error": f"HTTP {resp.status}"}
+                    return {"status": "error", "error": f"HTTP {resp.status}: {text[:200]}"}
                 try:
                     return json.loads(text)
                 except Exception:
@@ -81,26 +79,22 @@ async def call_controller(endpoint: str, data: dict, timeout: int = 60) -> dict:
 
 
 async def poll_controller_state(room: str, target_phase: str, timeout: int = 60) -> dict:
-    """Pollt /v1/room/{room}/state bis target_phase erreicht."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
                 async with s.get(f"{CONTROLLER_URL}/v1/room/{room}/state") as resp:
                     state = await resp.json()
-                    if state.get("phase") == target_phase:
+                    phase = state.get("phase", "")
+                    if phase == target_phase:
                         return state
-                    if state.get("phase") == "failed":
+                    if phase == "failed":
                         return state
         except Exception:
             pass
         await asyncio.sleep(0.5)
     return {"phase": "timeout"}
 
-
-# ══════════════════════════════════════════════════════════════════
-#  BACKEND CLIENT
-# ══════════════════════════════════════════════════════════════════
 
 async def fetch_forward_list() -> str:
     headers = {"Content-Type": "application/json"}
@@ -113,9 +107,10 @@ async def fetch_forward_list() -> str:
                     data = await resp.json()
                     if not data:
                         return "Keine Weiterleitungen konfiguriert."
-                    lines = [f"{i}) {f['name']} → {f['destination']}" for i, f in enumerate(data, 1)]
-                    return "Verfügbare Weiterleitungen:\n" + "\n".join(lines)
-                return f"Fehler beim Laden (Status {resp.status})"
+                    return "Weiterleitungen:\n" + "\n".join(
+                        f"{i}) {f['name']} → {f['destination']}" for i, f in enumerate(data, 1)
+                    )
+                return f"Fehler (Status {resp.status})"
     except Exception as e:
         return f"Weiterleitungen nicht verfügbar: {e}"
 
@@ -137,84 +132,82 @@ async def resolve_forward(name: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TRANSFER FLOW
+#  TRANSFER
 # ══════════════════════════════════════════════════════════════════
 
 async def execute_transfer(room_name: str, target: str, announce: bool,
-                           conversation_summary: str = "") -> str:
-    """Führt Transfer über Controller aus. Pollt auf Status-Änderungen."""
-
+                           summary_text: str = "") -> str:
     mode = "warm" if announce else "cold"
-
     if not target.startswith("+"):
         target = await resolve_forward(target)
     if not target.startswith("+"):
         return f"Keine gültige Rufnummer für '{target}'."
 
-    logger.info(f"[{room_name}] Transfer: {target} mode={mode}")
-
-    # 1. Transfer starten (non-blocking)
-    result = await call_controller("/v1/transfer", {
-        "room": room_name,
-        "target": target,
-        "mode": mode,
-    })
+    result = await call_controller("/v1/transfer", {"room": room_name, "target": target, "mode": mode})
     if result.get("status") == "error":
         return f"Transfer fehlgeschlagen: {result.get('error', 'unbekannt')}"
 
-    # 2. Auf Agent warten
-    state = await poll_controller_state(room_name, "briefing" if announce else "connected",
-                                        timeout=TRANSFER_TIMEOUT)
-
+    state = await poll_controller_state(room_name, "briefing" if announce else "connected", TRANSFER_TIMEOUT)
     phase = state.get("phase", "unknown")
 
     if phase == "failed":
-        return "Der Ansprechpartner war nicht erreichbar. Was möchten Sie tun?"
-
+        return "Der Ansprechpartner war nicht erreichbar."
     if phase == "timeout":
-        return "Die Verbindung zum Ansprechpartner dauert länger als erwartet."
+        return "Die Verbindung dauert länger als erwartet."
 
     if phase == "connected":
-        # Cold transfer done
+        await call_controller("/v1/disconnect-bot", {"room": room_name})
         return f"Durchgestellt zu {target}."
 
     if phase == "briefing":
-        # Warm: Bot soll jetzt briefen
-        summary_text = conversation_summary or "der Anrufer möchte mit Ihnen sprechen."
         return (
-            f"STATUS: Der Ansprechpartner ist jetzt verbunden und hört NUR dich.\n"
-            f"Der Anrufer hört Wartemusik und bekommt nichts mit.\n\n"
-            f"Bitte briefe den Ansprechpartner kurz:\n"
-            f"{summary_text}\n\n"
-            f"Sag am Ende EXAKT: 'Ich stelle jetzt durch.'\n"
-            f"Danach wirst du aus dem Raum entfernt."
+            f"Der Ansprechpartner ist jetzt in der Leitung. "
+            f"Der Anrufer hört Wartemusik. "
+            f"Briefe jetzt kurz: {summary_text} "
+            f"Beende exakt mit: Ich stelle jetzt durch."
         )
 
-    return f"Unbekannter Transfer-Status: {phase}"
+    return f"Unbekannter Status: {phase}"
 
 
 async def complete_warm_transfer(room_name: str):
-    """Briefing abgeschlossen → Controller verbinden + Bot entfernen."""
-    await call_controller("/v1/briefing-complete", {"room": room_name})
+    result = await call_controller("/v1/briefing-complete", {"room": room_name})
+    if result.get("status") != "connected":
+        logger.error(f"[{room_name}] briefing-complete failed: {result}")
+        return result
     await asyncio.sleep(0.5)
-    await call_controller("/v1/disconnect-bot", {"room": room_name})
+    disc = await call_controller("/v1/disconnect-bot", {"room": room_name})
+    logger.info(f"[{room_name}] disconnect-bot: {disc}")
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TRANSFER STAGE — ersetzt Text-Watcher durch expliziten Flow
+#  CONVERSATION TRACKER
+# ══════════════════════════════════════════════════════════════════
+
+class ConversationTracker(FrameProcessor):
+    def __init__(self, history: list, **kwargs):
+        super().__init__(**kwargs)
+        self._history = history
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            text = frame.text.strip()
+            if text:
+                self._history.append({"role": "user", "content": text, "ts": time.time()})
+        elif isinstance(frame, TTSTextFrame):
+            text = frame.text.strip()
+            if text:
+                self._history.append({"role": "assistant", "content": text, "ts": time.time()})
+        await self.push_frame(frame, direction)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TRANSFER STAGE
 # ══════════════════════════════════════════════════════════════════
 
 class TransferStage(FrameProcessor):
-    """
-    Verwaltet den Transfer-Lifecycle explizit — kein Text-Matching.
-
-    Modi:
-      - idle: normales Gespräch
-      - awaiting_briefing: auf Controller-Signal wartend
-      - briefing: Bot brieft Agent
-      - done: Transfer abgeschlossen
-    """
-
     def __init__(self, room_name: str, **kwargs):
         super().__init__(**kwargs)
         self._room = room_name
@@ -224,70 +217,27 @@ class TransferStage(FrameProcessor):
     def set_task(self, task: PipelineTask):
         self._task = task
 
-    async def start_briefing(self, summary: str):
-        """Controller hat agent verbunden → Bot soll briefen."""
-        self._mode = "briefing"
-        logger.info(f"[{self._room}] Briefing phase active")
-
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
 
         if self._mode == "briefing":
             if isinstance(frame, TTSTextFrame):
                 text = frame.text.strip()
-                # Exakter Trigger: Satz endet mit der Abschlussfloskel
                 if text.endswith("Ich stelle jetzt durch.") or text.endswith("ich stelle jetzt durch."):
                     self._mode = "done"
-                    logger.info(f"[{self._room}] Briefing complete, connecting + disconnecting bot")
-                    asyncio.create_task(self._finish_transfer())
+                    logger.info(f"[{self._room}] Briefing complete")
+                    asyncio.create_task(self._finish())
 
         await self.push_frame(frame, direction)
 
-    async def _finish_transfer(self):
+    async def _finish(self):
         await complete_warm_transfer(self._room)
-        # Signal pipeline to stop
         if self._task:
             await self._task.queue_frame(EndFrame())
 
 
 # ══════════════════════════════════════════════════════════════════
-#  FUNCTION TOOLS
-# ══════════════════════════════════════════════════════════════════
-
-def make_tools():
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "weiterleitungen_abrufen",
-                "description": "Liste verfügbare Weiterleitungen. IMMER vor verbinden() aufrufen.",
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "verbinden",
-                "description": (
-                    "Stellt Anrufer durch. ansagen=true: Warm (du brieft vorher, "
-                    "Caller hört nichts vom Briefing). ansagen=false: Cold (direkt). "
-                    "ziel = Telefonnummer (+49...) oder Name aus der Weiterleitungsliste."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "ziel": {"type": "string", "description": "Rufnummer oder Name"},
-                        "ansagen": {"type": "boolean", "description": "true=warm, false=cold"},
-                    },
-                    "required": ["ziel", "ansagen"],
-                },
-            },
-        },
-    ]
-
-
-# ══════════════════════════════════════════════════════════════════
-#  SYSTEM PROMPT
+#  AGENT
 # ══════════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """Du bist ein freundlicher Telefonassistent. Sprich Deutsch, kurz und natürlich.
@@ -295,106 +245,67 @@ SYSTEM_PROMPT = """Du bist ein freundlicher Telefonassistent. Sprich Deutsch, ku
 VERHALTEN:
 - Sprich wie ein Mensch, keine langen Monologe.
 - Will der Anrufer jemanden sprechen: erst weiterleitungen_abrufen(), dann verbinden().
+- Interne Statushinweise nie wörtlich vorlesen.
 
 WARM-TRANSFER (ansagen=true):
-Nachdem die Verbindung zum Ansprechpartner hergestellt wurde, 
-sprichst du NUR mit dem Ansprechpartner. Der Anrufer hört Wartemusik.
+Du sprichst NUR mit dem Ansprechpartner. Der Anrufer hört Wartemusik.
 Briefe den Ansprechpartner kurz: Wer ruft an, was ist das Anliegen?
-Beende dein Briefing EXAKT mit dem Satz: 'Ich stelle jetzt durch.'
-Danach wirst du automatisch entfernt und das Gespräch läuft direkt.
+Beende dein Briefing EXAKT: 'Ich stelle jetzt durch.'
 
 COLD-TRANSFER (ansagen=false):
 Der Anrufer wird direkt verbunden."""
 
 
-# ══════════════════════════════════════════════════════════════════
-#  AGENT
-# ══════════════════════════════════════════════════════════════════
-
 async def run_agent(room_name: str):
     transfer_stage = TransferStage(room_name)
+    conversation_history = []
+    conversation_tracker = ConversationTracker(conversation_history)
 
-    # Transport — Bot managed Subscriptions NICHT selbst
     transport = LiveKitTransport(
         url=LIVEKIT_URL,
         api_key=LIVEKIT_API_KEY,
         api_secret=LIVEKIT_API_SECRET,
         room_name=room_name,
         bot_identity=f"pipecat-bot-{int(time.time())}",
-        params=LiveKitParams(
-            auto_subscribe=False,  # Controller steuert, was der Bot hört
+        params=LiveKitParams(auto_subscribe=False),
+    )
+
+    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY, model=DEEPGRAM_MODEL, language=DEEPGRAM_LANGUAGE)
+    llm = OpenAILLMService(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, model=LLM_MODEL)
+    tts = AzureHttpTTSService(api_key=AZURE_TTS_KEY, region=AZURE_TTS_REGION, voice=AZURE_TTS_VOICE)
+
+    # ToolsSchema
+    tools_schema = ToolsSchema(standard_tools=[
+        FunctionSchema(
+            name="weiterleitungen_abrufen",
+            description="Liste verfügbare Weiterleitungen. IMMER vor verbinden() aufrufen.",
+            properties={}, required=[],
         ),
-    )
-
-    stt = DeepgramSTTService(
-        api_key=DEEPGRAM_API_KEY,
-        model=DEEPGRAM_MODEL,
-        language=DEEPGRAM_LANGUAGE,
-    )
-
-    llm = OpenAILLMService(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
-        model=LLM_MODEL,
-    )
-
-    tts = AzureHttpTTSService(
-        api_key=AZURE_TTS_KEY,
-        region=AZURE_TTS_REGION,
-        voice=AZURE_TTS_VOICE,
-    )
-
-    # Tools registrieren
-    tools = make_tools()
-
-    # Korrekte Pipecat-Tool-Registrierung
-    llm.register_function("weiterleitungen_abrufen", None)
-    llm.register_function("verbinden", None)
-
-    context = LLMContextAggregatorPair(
-        llm=llm,
-        user_params=LLMUserAggregatorParams(system_prompt=SYSTEM_PROMPT),
-    )
-
-    # Korrekte Pipeline-Reihenfolge:
-    # Audio → STT → UserContext → LLM → TTS → TransferStage → Output → AssistantContext
-    pipeline = Pipeline([
-        transport.input(),
-        stt,
-        context.user(),
-        llm,
-        tts,
-        transfer_stage,
-        transport.output(),
-        context.assistant(),
+        FunctionSchema(
+            name="verbinden",
+            description="Stellt Anrufer durch. ansagen=true Warm, ansagen=false Cold.",
+            properties={
+                "ziel": {"type": "string", "description": "Rufnummer oder Name"},
+                "ansagen": {"type": "boolean", "description": "true=warm, false=cold"},
+            },
+            required=["ziel", "ansagen"],
+        ),
     ])
 
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(
-            allow_interruptions=True,
-            enable_metrics=True,
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "Beginne das Gespräch freundlich."},
+    ]
+
+    llm_context = LLMContext(messages=messages, tools=tools_schema)
+
+    context = LLMContextAggregatorPair(
+        llm_context,
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
 
-    transfer_stage.set_task(task)
-
-    # Gesprächsspeicher für Briefing-Summary
-    conversation_history = []
-
-    @transport.event_handler("on_first_participant_joined")
-    async def on_first(transport, participant_id):
-        logger.info(f"[{room_name}] First participant: {participant_id}")
-
-    @transport.event_handler("on_participant_joined")
-    async def on_joined(transport, participant_id):
-        logger.info(f"[{room_name}] Participant joined: {participant_id}")
-
-    # Function handler
-    async def handle_function(function_name: str, tool_call_id: str,
-                              args: dict, llm_service):
-        logger.info(f"[{room_name}] FUNCTION CALL: {function_name} args={args}")
+    async def handle_function(function_name: str, tool_call_id: str, args: dict):
+        logger.info(f"FUNCTION CALL: {function_name} args={args} room={room_name}")
 
         if function_name == "weiterleitungen_abrufen":
             return await fetch_forward_list()
@@ -403,41 +314,50 @@ async def run_agent(room_name: str):
             ziel = args.get("ziel", "")
             ansagen = args.get("ansagen", False)
 
-            # Briefing-Summary aus Konversation
             summary = "Der Anrufer möchte mit Ihnen sprechen."
             if conversation_history:
-                recent = [m.get("content", "") for m in conversation_history[-6:]
-                          if m.get("role") == "user"]
-                if recent:
-                    summary = f"Anliegen des Anrufers: {' '.join(recent[-3:])}"
+                user_msgs = [m.get("content", "") for m in conversation_history[-6:]
+                             if m.get("role") == "user"]
+                if user_msgs:
+                    summary = f"Anliegen: {' '.join(user_msgs[-3:])}"
 
             result = await execute_transfer(room_name, ziel, ansagen, summary)
 
-            if ansagen and "STATUS:" in result:
+            if ansagen and "Der Ansprechpartner ist jetzt" in result:
                 transfer_stage._mode = "briefing"
-                # Entferne die Meta-Anweisung für das LLM — nur die Briefing-Info
-                result = result.replace("STATUS: ", "")
 
             return result
 
         return f"Unbekannte Funktion: {function_name}"
 
-    # Handler registrieren (Pipecat 1.1 pattern)
-    llm.register_function("weiterleitungen_abrufen",
-                          lambda name, tid, a: handle_function(name, tid, a, None))
-    llm.register_function("verbinden",
-                          lambda name, tid, a: handle_function(name, tid, a, None))
+    llm.register_function("weiterleitungen_abrufen", handle_function)
+    llm.register_function("verbinden", handle_function)
 
-    # Conversation tracker
-    @transport.event_handler("on_user_started_speaking")
-    async def on_user_start(transport):
-        pass
+    pipeline = Pipeline([
+        transport.input(),
+        stt,
+        conversation_tracker,
+        context.user(),
+        llm,
+        tts,
+        transfer_stage,
+        transport.output(),
+        context.assistant(),
+    ])
+
+    task = PipelineTask(pipeline, params=PipelineParams(
+        allow_interruptions=True, enable_metrics=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ))
+    transfer_stage.set_task(task)
+
+    @transport.event_handler("on_first_participant_joined")
+    async def on_first(transport, participant_id):
+        logger.info(f"[{room_name}] First participant: {participant_id}")
 
     runner = PipelineRunner()
     await runner.run(task)
 
-
-# ══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import sys

@@ -37,14 +37,14 @@ from pipecat.transports.daily.transport import DailyDialinSettings, DailyParams,
 load_dotenv()
 
 CONFIG = {
-    "redis_url": os.getenv("REDIS_URL", "redis://:83d2012a4dd4fc566590d473b0fc70e31ca14f4ffed909cd0a71ac956fb01bef@localhost:6379"),
+    "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379"),
     "backend_url": os.getenv("BACKEND_URL", "http://localhost:8000"),
     "ha_api_key": os.getenv("HA_API_KEY", ""),
     "dashboard_user": os.getenv("DASHBOARD_USER", "admin"),
     "dashboard_password": os.getenv("DASHBOARD_PASSWORD", "changeme123"),
     "dashboard_port": int(os.getenv("DASHBOARD_PORT", "8091")),
     "deepgram_api_key": os.getenv("DEEPGRAM_API_KEY"),
-    "mistral_api_key": os.getenv("MISTRAL_API_KEY", "8J9XjxCREn1XtHGpUXdiHIlmoi8KC3k7"),
+    "mistral_api_key": os.getenv("MISTRAL_API_KEY", ""),
     "deepgram_model": os.getenv("DEEPGRAM_MODEL", "nova-3"),
     "deepgram_language": os.getenv("DEEPGRAM_LANGUAGE", "de"),
     "deepgram_base_url": os.getenv("DEEPGRAM_BASE_URL", ""),
@@ -375,6 +375,7 @@ class CallSession:
         self.from_number = from_number
         self.called_did = ""
         self.start_time = time.time()
+        self.finalized = False
         self.live_transcript = []
         self.messages = []
         self.tenant_config = {}
@@ -416,20 +417,27 @@ _watchdog_tasks = {}
 # =============================================================================
 
 async def finalize_call(session):
+    if session.finalized:
+        return
+    session.finalized = True
+
     logger.info(f"[{session.call_sid}] Call wird finalisiert (Dauer: {session.duration}s)")
     await _event_bus.publish(session.call_sid, {"type": "call_end", "duration": session.duration})
     await save_call_to_redis(session.to_dict())
     await save_lead_to_redis(session.lead_id, session.call_sid, session.duration, [m for m in session.messages if m["role"] != "system"])
     await send_summary_email(session)
     _sessions.pop(session.call_sid, None)
-    if session.call_sid in _watchdog_tasks:
-        _watchdog_tasks.pop(session.call_sid, None)
+    task = _watchdog_tasks.pop(session.call_sid, None)
+    if task:
+        task.cancel()
 
 # =============================================================================
 # DYNAMIC TOOLS
 # =============================================================================
 
 async def handle_firmenwissen(function_name, tool_call_id, args, llm, context, result_callback):
+    logger.info(f"TOOL CALL: {function_name=} {tool_call_id=} {args=}")
+    logger.info(f"Known sessions: {list(_sessions.keys())}")
     query = args.get("query", "")
     api_key = session_dynamic_api_key(_sessions.get(tool_call_id, ""), "ha")
     result = await query_knowledge(query, api_key)
@@ -830,20 +838,6 @@ async def run_bot(transport, session):
         ))
         llm.register_function("execute_api_tool", handle_execute_api_tool)
 
-    messages = session.messages.copy()
-    initial_prompt = {"role": "user", "content": "Beginne jetzt das Gespraech. Begruesse den Anrufer gemaess dem Gespraechsablauf."}
-    if CONFIG.get("llm_no_think"):
-        messages[0]["content"] = "/no_think\n" + messages[0]["content"]
-    messages.append(initial_prompt)
-
-    context = LLMContext(messages=messages, tools=ToolsSchema(standard_tools=tools_schema) if tools_schema else None)
-    context_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
-    )
-
-    await _event_bus.publish(session.call_sid, {"type": "call_start", "lead_id": session.lead_id})
-
     task_ref = []
 
     async def handle_end_call(function_name, tool_call_id, args, llm, context, result_callback):
@@ -860,12 +854,34 @@ async def run_bot(transport, session):
     ))
     llm.register_function("end_call", handle_end_call)
 
+    messages = session.messages.copy()
+    initial_prompt = {"role": "user", "content": "Beginne jetzt das Gespraech. Begruesse den Anrufer gemaess dem Gespraechsablauf."}
+    if CONFIG.get("llm_no_think"):
+        messages[0]["content"] = "/no_think\n" + messages[0]["content"]
+    messages.append(initial_prompt)
+
+    context = LLMContext(messages=messages, tools=ToolsSchema(standard_tools=tools_schema) if tools_schema else None)
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+    )
+
+    await _event_bus.publish(session.call_sid, {"type": "call_start", "lead_id": session.lead_id})
+
+    # Transcript-Prozessoren
+    transcript_processor = TranscriptProcessor(session, _event_bus)
+    assistant_transcript_processor = AssistantTranscriptProcessor(session, _event_bus)
+    ssml_strip = SSMLStripProcessor()
+
     pipeline = Pipeline([
         transport.input(),
         stt,
+        transcript_processor,
         context_aggregator.user(),
         llm,
+        ssml_strip,
         tts,
+        assistant_transcript_processor,
         transport.output(),
         context_aggregator.assistant(),
     ])
