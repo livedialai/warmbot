@@ -304,11 +304,13 @@ async def run_agent(room_name: str):
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
 
-    async def handle_function(function_name: str, tool_call_id: str, args: dict):
+    async def handle_function(function_name: str, tool_call_id: str, args: dict,
+                              llm, context, result_callback):
         logger.info(f"FUNCTION CALL: {function_name} args={args} room={room_name}")
 
         if function_name == "weiterleitungen_abrufen":
-            return await fetch_forward_list()
+            await result_callback(await fetch_forward_list())
+            return
 
         if function_name == "verbinden":
             ziel = args.get("ziel", "")
@@ -326,9 +328,10 @@ async def run_agent(room_name: str):
             if ansagen and "Der Ansprechpartner ist jetzt" in result:
                 transfer_stage._mode = "briefing"
 
-            return result
+            await result_callback(result)
+            return
 
-        return f"Unbekannte Funktion: {function_name}"
+        await result_callback(f"Unbekannte Funktion: {function_name}")
 
     llm.register_function("weiterleitungen_abrufen", handle_function)
     llm.register_function("verbinden", handle_function)
