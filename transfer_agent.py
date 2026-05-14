@@ -23,7 +23,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.frames.frames import (
-    EndFrame, TTSTextFrame, TranscriptionFrame,
+    EndFrame, LLMRunFrame, TTSTextFrame, TranscriptionFrame,
     UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
 )
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -271,8 +271,20 @@ async def run_agent(room_name: str):
     )
 
     stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY, model=DEEPGRAM_MODEL, language=DEEPGRAM_LANGUAGE)
-    llm = OpenAILLMService(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, model=LLM_MODEL)
-    tts = AzureHttpTTSService(api_key=AZURE_TTS_KEY, region=AZURE_TTS_REGION, voice=AZURE_TTS_VOICE)
+    llm = OpenAILLMService(
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        settings=OpenAILLMService.Settings(model=LLM_MODEL),
+    )
+
+    tts = AzureHttpTTSService(
+        api_key=AZURE_TTS_KEY,
+        region=AZURE_TTS_REGION,
+        settings=AzureHttpTTSService.Settings(
+            voice=AZURE_TTS_VOICE,
+            language="de-DE",
+        ),
+    )
 
     # ToolsSchema
     tools_schema = ToolsSchema(standard_tools=[
@@ -357,6 +369,8 @@ async def run_agent(room_name: str):
     @transport.event_handler("on_first_participant_joined")
     async def on_first(transport, participant_id):
         logger.info(f"[{room_name}] First participant: {participant_id}")
+        await context.user().push_context_frame()
+        await task.queue_frames([LLMRunFrame()])
 
     runner = PipelineRunner()
     await runner.run(task)

@@ -340,7 +340,7 @@ async def cancel_transfer(room_name: str):
 
 
 async def disconnect_bot(room_name: str):
-    rs = _rooms.get(room_name)
+    rs = await discover_room(room_name)
     if not rs or not rs.bot:
         return {"status": "error", "error": "no bot in room"}
     try:
