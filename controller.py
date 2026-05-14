@@ -33,6 +33,7 @@ from livekit import api as lk_api
 from livekit.api.room_service import (
     UpdateSubscriptionsRequest,
     ListParticipantsRequest,
+    RoomParticipantIdentity,
 )
 from livekit.api.sip_service import CreateSIPParticipantRequest
 
@@ -76,6 +77,7 @@ class RoomState:
     music: Optional[Participant] = None
     music_track_sid: Optional[str] = None
     agent_number: str = ""
+    active_agent_identity: str = ""  # identity des aktuellen Transfer-Agenten
     transfer_mode: str = ""
     transferring: bool = False  # async transfer in progress
 
@@ -131,10 +133,9 @@ async def discover_room(room_name: str) -> RoomState:
                 rs.bot = Participant(identity, track_sids)
 
             elif identity.startswith("agent-"):
-                # Only recognize the CURRENT agent for this transfer
-                if rs.agent_number and identity == f"agent-{int(time.time()) if rs.agent_number else ''}":
-                    pass  # identity comes from SIP create, match below
-                rs.agent = Participant(identity, track_sids)
+                # Nur den AKTIVEN Agenten dieses Transfers erkennen
+                if rs.active_agent_identity and identity == rs.active_agent_identity:
+                    rs.agent = Participant(identity, track_sids)
 
             else:
                 # Any other = Caller (SIP participant)
@@ -222,9 +223,10 @@ async def apply_phase_matrix(rs: RoomState):
         await set_exact_hears(rs, rs.music, [])
 
     elif rs.phase == Phase.MUSIC:
-        # Caller → Musik, Bot → Caller (optional, für Unterbrechbarkeit), Music → nichts
+        # Caller → Musik, Bot → Caller, Agent → nichts, Music → nichts
         await set_exact_hears(rs, rs.caller, [m] if m else [])
         await set_exact_hears(rs, rs.bot, c_tracks)
+        await set_exact_hears(rs, rs.agent, [])   # Sicherstellen: Agent hört nichts
         await set_exact_hears(rs, rs.music, [])
 
     elif rs.phase == Phase.BRIEFING:
@@ -287,6 +289,10 @@ async def execute_transfer(room_name: str, target: str, mode: str):
         logger.error(f"[{room_name}] Room not found for transfer")
         return
 
+    # Erst frisch discovern, dann Phase setzen
+    rs = await discover_room(room_name)
+    _rooms[room_name] = rs
+
     # Reset für neuen Transfer
     rs.agent = None
     rs.agent_number = target
@@ -298,6 +304,8 @@ async def execute_transfer(room_name: str, target: str, mode: str):
 
     # Agent via SIP anrufen
     agent_identity = f"agent-{uuid.uuid4().hex[:12]}"
+    rs.active_agent_identity = agent_identity
+    _rooms[room_name] = rs
     try:
         await get_lk().sip.create_sip_participant(
             CreateSIPParticipantRequest(
@@ -383,7 +391,7 @@ async def disconnect_bot(room_name: str):
         return {"status": "error", "error": "no bot in room"}
     try:
         await get_lk().room.remove_participant(
-            lk_api.room_service.RoomParticipantIdentity(
+            RoomParticipantIdentity(
                 room=room_name,
                 identity=rs.bot.identity,
             )
@@ -410,9 +418,8 @@ async def monitor_room(room_name: str):
             current = snapshot(rs)
 
             if current != last_snapshot:
-                # Auto-apply wenn nicht mitten im async transfer
-                if not rs.transferring:
-                    await apply_phase_matrix(rs)
+                # Matrix ist idempotent — immer anwenden
+                await apply_phase_matrix(rs)
                 last_snapshot = current
 
         except Exception as e:
